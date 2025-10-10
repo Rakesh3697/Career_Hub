@@ -1,137 +1,173 @@
-import streamlit as st
-import google.generativeai as genai
 import os
-import docx2txt
-import PyPDF2 as pdf
+import streamlit as st
+import pandas as pd
+import google.generativeai as genai
+from PyPDF2 import PdfReader
 from dotenv import load_dotenv
-import spacy
+from datetime import datetime
 
-# Load environment variables from a .env file
+# Load API key from .env
 load_dotenv()
-
-# Configure the generative AI model with the Google API key
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Set up the model configuration for text generation
-generation_config = {
-    "temperature": 0.4,
-    "top_p": 1,
-    "top_k": 32,
-    "max_output_tokens": 4096,
-}
+# Create folders if not exist
+RESUME_FOLDER = "resumes"
+os.makedirs(RESUME_FOLDER, exist_ok=True)
+JOB_TRACKER_FILE = "job_tracker.csv"
 
-# Define safety settings for content generation
-safety_settings = [
-    {"category": f"HARM_CATEGORY_{category}", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-    for category in ["HARASSMENT", "HATE_SPEECH", "SEXUALLY_EXPLICIT", "DANGEROUS_CONTENT"]
-]
+# Load Job Tracker CSV
+def load_jobs():
+    if os.path.exists(JOB_TRACKER_FILE):
+        return pd.read_csv(JOB_TRACKER_FILE)
+    else:
+        return pd.DataFrame(columns=["Company", "Role", "Application Date", "Status"])
 
-# Load NLP model
-nlp = spacy.load("en_core_web_sm")
+# Save Job Tracker CSV
+def save_jobs(df):
+    df.to_csv(JOB_TRACKER_FILE, index=False)
 
-def generate_response_from_gemini(input_text):
-    llm = genai.GenerativeModel(
-        model_name="gemini-pro",
-        generation_config=generation_config,
-        safety_settings=safety_settings,
-    )
-    output = llm.generate_content(input_text)
-    return output.text
+# Extract text from PDF
+def extract_pdf_text(file):
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
 
-def extract_text_from_pdf_file(uploaded_file):
-    pdf_reader = pdf.PdfReader(uploaded_file)
-    text_content = ""
-    for page in pdf_reader.pages:
-        text_content += str(page.extract_text())
-    return text_content
+# Candidate-Facing ATS Analyzer prompt
+def construct_candidate_resume_prompt(resume, jd):
+    return f"""
+    Act as a career coach and ATS assistant. Evaluate the candidate's resume against the job description.
+    Provide:
+    1. Match percentage (0-100) with the job description.
+    2. Key skills that the candidate is missing.
+    3. Candidate's strengths and weaknesses based on the resume.
+    4. Tips to improve the resume for better ATS compatibility.
 
-def extract_text_from_docx_file(uploaded_file):
-    return docx2txt.process(uploaded_file)
+    Candidate Resume:
+    {resume}
 
-def extract_skills_and_experience(text):
-    doc = nlp(text)
-    skills = []
-    experiences = []
+    Job Description:
+    {jd}
+    """
 
-    for ent in doc.ents:
-        if ent.label_ in ["SKILL", "EXPERIENCE"]:
-            if ent.label_ == "SKILL":
-                skills.append(ent.text)
-            elif ent.label_ == "EXPERIENCE":
-                experiences.append(ent.text)
+# Cold Email Generator prompt
+def construct_email_prompt(resume_text, role, company=None, purpose=None, jd=None):
+    company_text = f"Company: {company}" if company else ""
+    purpose_text = f"Purpose: {purpose}" if purpose else ""
+    jd_text = f"Job Description: {jd}" if jd else ""
+    return f"""
+    Act as a professional copywriter. Generate a concise and persuasive cold email applying for a role.
+    Use the information from the candidate's resume below to highlight relevant skills, experience, and achievements.
+    The email should be polite, professional, and tailored to the {role} role.
+    {company_text}
+    {purpose_text}
+    {jd_text}
 
-    return skills, experiences
+    Candidate Resume:
+    {resume_text}
+    """
 
-# Prompt Template
-input_prompt_template = """
-As an experienced Applicant Tracking System (ATS) analyst,
-with profound knowledge in technology, software engineering, data science, 
-and big data engineering, your role involves evaluating resumes against job descriptions.
-Recognizing the competitive job market, provide top-notch assistance for resume improvement.
-Your goal is to analyze the resume against the given job description, 
-assign a percentage match based on key criteria, and pinpoint missing keywords accurately.
-resume:{text}
-description:{job_description}
-I want the response in one single string having the structure
-{{"Job Description Match":"%","Missing Keywords":"","Candidate Summary":"","Experience":""}}
-"""
+# Call Gemini API
+def get_gemini_response(prompt):
+    model = genai.GenerativeModel("models/gemini-2.5-flash")
+    response = model.generate_content(prompt)
+    return response.text
 
-# Streamlit app
-st.title("Intelligent ATS - Enhance Your Resume ATS")
-st.markdown('<style>h1{color: orange; text-align: center;}</style>', unsafe_allow_html=True)
-job_description = st.text_area("Paste the Job Description", height=300)
-uploaded_file = st.file_uploader("Upload Your Resume", type=["pdf", "docx"], help="Please upload a PDF or DOCX file")
-
-submit_button = st.button("Submit")
-
-if submit_button:
-    if uploaded_file is not None:
-        if uploaded_file.type == "application/pdf":
-            resume_text = extract_text_from_pdf_file(uploaded_file)
-        elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            resume_text = extract_text_from_docx_file(uploaded_file)
-
-        # Extract skills and experience
-        skills, experiences = extract_skills_and_experience(resume_text)
+# Streamlit UI
+def main():
+    st.title("AI-Powered Job Seeker Tools")
+    
+    # Sidebar menu
+    menu = ["ATS Resume Analyzer", "Cold Email Generator", "Job Tracker", "Resume Folder"]
+    choice = st.sidebar.selectbox("Choose a tool", menu)
+    
+    if choice == "ATS Resume Analyzer":
+        st.header("ATS Resume Analyzer (Candidate Self-Check)")
+        job_desc = st.text_area("Paste Job Description")
+        uploaded_file = st.file_uploader("Upload Your Resume (PDF)", type=["pdf"])
         
+        if st.button("Check Resume"):
+            if not job_desc or not uploaded_file:
+                st.error("Please provide both job description and resume.")
+                return
 
+            resume_text = extract_pdf_text(uploaded_file)
+            prompt = construct_candidate_resume_prompt(resume_text, job_desc)
+            response = get_gemini_response(prompt)
 
-        # Generate response from the Gemini model
-        response_text = generate_response_from_gemini(input_prompt_template.format(text=resume_text, job_description=job_description))
+            st.subheader("ATS Analysis Results")
+            st.write(response)
+    
+    elif choice == "Cold Email Generator":
+        st.header("Cold Email Generator")
+        uploaded_file = st.file_uploader("Upload Resume (PDF)", type=["pdf"])
+        company = st.text_input("Company Name")
+        role = st.text_input("Role / Position")
+        purpose = st.text_area("Purpose / Message")
+        jd = st.text_area("Paste Job Description (optional)")
 
-        # Extract Job Description Match percentage from the response
-        match_percentage_str = response_text.split('"Job Description Match":"')[1].split('"')[0]
+        if st.button("Generate Cold Email"):
+            if not uploaded_file or not role:
+                st.error("Please upload your resume and specify the role.")
+                return
+            
+            resume_text = extract_pdf_text(uploaded_file)
+            prompt = construct_email_prompt(resume_text, role, company, purpose, jd)
+            response = get_gemini_response(prompt)
 
-        # Remove percentage symbol and convert to float
-        match_percentage = float(match_percentage_str.rstrip('%'))
+            st.subheader("Generated Cold Email")
+            st.write(response)
+    
+    elif choice == "Job Tracker":
+        st.header("Job Tracker")
+        df = load_jobs()
+        
+        with st.form("add_job_form"):
+            st.subheader("Add New Job Application")
+            new_company = st.text_input("Company Name")
+            new_role = st.text_input("Role / Position")
+            new_status = st.selectbox("Status", ["Applied", "Interview", "Offer", "Rejected"])
+            submitted = st.form_submit_button("Add Job")
+            
+            if submitted:
+                new_entry = {
+                    "Company": new_company,
+                    "Role": new_role,
+                    "Application Date": datetime.today().strftime("%Y-%m-%d"),
+                    "Status": new_status
+                }
+                df = pd.concat([df, pd.DataFrame([new_entry])], ignore_index=True)
+                save_jobs(df)
+                st.success("Job added successfully!")
 
-        st.subheader("ATS Evaluation Result:")
-        st.write(response_text)
-
-        # Display message based on Job Description Match percentage
-        if match_percentage >= 60:
-            st.text("Candidate is a good match for the position.")
-            if experiences:
-                st.text(f"Highlighted Experience: {experiences_str}")
+        st.subheader("Your Job Applications")
+        st.dataframe(df)
+    
+    elif choice == "Resume Folder":
+        st.header("Resume Folder")
+        st.subheader("Upload New Resume")
+        uploaded_file = st.file_uploader("Upload Resume PDF", type=["pdf"])
+        
+        if st.button("Save Resume"):
+            if uploaded_file is not None:
+                save_path = os.path.join(RESUME_FOLDER, uploaded_file.name)
+                with open(save_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                st.success(f"Resume saved: {uploaded_file.name}")
+            else:
+                st.error("Please upload a PDF file.")
+        
+        st.subheader("Stored Resumes")
+        resumes = os.listdir(RESUME_FOLDER)
+        if resumes:
+            for r in resumes:
+                st.write(r)
+                if st.button(f"Download {r}"):
+                    with open(os.path.join(RESUME_FOLDER, r), "rb") as f:
+                        st.download_button(label=f"Download {r}", data=f, file_name=r)
         else:
-            st.text("Candidate is not a match.")
+            st.info("No resumes stored yet.")
 
-# Footer with your name and email
-footer = """
-    <div style="
-        position: fixed;
-        bottom: 0;
-        right: 0;
-        width: 100%;
-        background-color: transparent;
-        text-align: right;
-        padding: 20px;
-        font-size: 14px;
-        color: grey;
-    ">
-        <p>Made by <b style="font-size:24px;">Rakesh T          </b>
-        <br>Email: <a href="mailto:rakeshthangaraj89@gmail.com">rakeshthangaraj89@gmail.com</a></p>
-    </div>
-"""
-
-st.markdown(footer, unsafe_allow_html=True)
+if __name__ == "__main__":
+    main()
